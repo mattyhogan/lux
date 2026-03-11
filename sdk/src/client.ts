@@ -8,8 +8,9 @@ export class Lux {
   private host: string;
   private port: number;
   private connected = false;
-  private buffer = "";
-  private queue: { resolve: (v: RespValue) => void; reject: (e: Error) => void }[] = [];
+  private chunks: Buffer[] = [];
+  private buf = Buffer.alloc(0);
+  private waiting: ((chunk: Buffer) => void) | null = null;
 
   constructor(config: LuxConfig) {
     this.host = config.host;
@@ -27,19 +28,18 @@ export class Lux {
         resolve();
       });
 
-      this.socket.on("data", (data) => {
-        this.buffer += data.toString();
-        this.processBuffer();
+      this.socket.on("data", (data: Buffer) => {
+        if (this.waiting) {
+          const cb = this.waiting;
+          this.waiting = null;
+          cb(data);
+        } else {
+          this.chunks.push(data);
+        }
       });
 
       this.socket.on("error", (err) => {
-        if (!this.connected) {
-          reject(new LuxConnectionError(err.message));
-        }
-        for (const entry of this.queue) {
-          entry.reject(new LuxError(err.message));
-        }
-        this.queue = [];
+        if (!this.connected) reject(new LuxConnectionError(err.message));
       });
 
       this.socket.on("close", () => {
@@ -63,19 +63,93 @@ export class Lux {
     }
   }
 
+  private async fillBuffer(): Promise<void> {
+    if (this.chunks.length > 0) {
+      const pending = Buffer.concat(this.chunks);
+      this.chunks.length = 0;
+      this.buf = this.buf.length > 0 ? Buffer.concat([this.buf, pending]) : pending;
+      return;
+    }
+
+    const chunk = await new Promise<Buffer>((resolve) => {
+      this.waiting = resolve;
+    });
+    this.buf = this.buf.length > 0 ? Buffer.concat([this.buf, chunk]) : chunk;
+  }
+
+  private consume(n: number): void {
+    this.buf = this.buf.subarray(n);
+  }
+
+  private async readLine(): Promise<string> {
+    while (true) {
+      const idx = this.buf.indexOf("\r\n");
+      if (idx !== -1) {
+        const line = this.buf.subarray(0, idx).toString();
+        this.consume(idx + 2);
+        return line;
+      }
+      await this.fillBuffer();
+    }
+  }
+
+  private async readExact(n: number): Promise<Buffer> {
+    while (this.buf.length < n) {
+      await this.fillBuffer();
+    }
+    const result = this.buf.subarray(0, n);
+    this.consume(n);
+    return result;
+  }
+
+  private async readReply(): Promise<RespValue> {
+    const line = await this.readLine();
+    const type = line[0];
+    const payload = line.slice(1);
+
+    switch (type) {
+      case "+":
+        return payload;
+      case "-":
+        throw new LuxError(payload);
+      case ":":
+        return parseInt(payload, 10);
+      case "$": {
+        const len = parseInt(payload, 10);
+        if (len === -1) return null;
+        const data = await this.readExact(len + 2);
+        return data.subarray(0, len).toString();
+      }
+      case "*": {
+        const count = parseInt(payload, 10);
+        if (count === -1) return null;
+        if (count === 0) return [];
+        const arr: RespValue[] = [];
+        for (let i = 0; i < count; i++) {
+          arr.push(await this.readReply());
+        }
+        return arr;
+      }
+      default:
+        throw new LuxError(`unknown RESP type: ${type}`);
+    }
+  }
+
+  private encode(args: (string | number)[]): string {
+    let out = `*${args.length}\r\n`;
+    for (const arg of args) {
+      const s = String(arg);
+      out += `$${Buffer.byteLength(s)}\r\n${s}\r\n`;
+    }
+    return out;
+  }
+
   async command(...args: (string | number)[]): Promise<RespValue> {
     if (!this.socket || !this.connected) {
       throw new LuxConnectionError("not connected");
     }
-
-    const encoded = this.encode(args);
-    return new Promise((resolve, reject) => {
-      this.queue.push({ resolve, reject });
-      this.socket!.write(encoded);
-      if (this.buffer.length > 0) {
-        this.processBuffer();
-      }
-    });
+    this.socket.write(this.encode(args));
+    return this.readReply();
   }
 
   async pipeline(commands: (string | number)[][]): Promise<RespValue[]> {
@@ -87,18 +161,17 @@ export class Lux {
     for (const args of commands) {
       encoded += this.encode(args);
     }
-
-    const promises: Promise<RespValue>[] = [];
-    for (let i = 0; i < commands.length; i++) {
-      promises.push(
-        new Promise((resolve, reject) => {
-          this.queue.push({ resolve, reject });
-        })
-      );
-    }
-
     this.socket.write(encoded);
-    return Promise.all(promises);
+
+    const results: RespValue[] = [];
+    for (let i = 0; i < commands.length; i++) {
+      try {
+        results.push(await this.readReply());
+      } catch (e) {
+        results.push(null);
+      }
+    }
+    return results;
   }
 
   async set(key: string, value: string, ttl?: number): Promise<string> {
@@ -226,78 +299,5 @@ export class Lux {
 
   async ping(): Promise<string> {
     return (await this.command("PING")) as string;
-  }
-
-  private encode(args: (string | number)[]): string {
-    let out = `*${args.length}\r\n`;
-    for (const arg of args) {
-      const s = String(arg);
-      out += `$${Buffer.byteLength(s)}\r\n${s}\r\n`;
-    }
-    return out;
-  }
-
-  private processBuffer(): void {
-    while (this.queue.length > 0 && this.buffer.length > 0) {
-      const result = this.parseOne(0);
-      if (result === null) break;
-
-      const [value, consumed] = result;
-      this.buffer = this.buffer.slice(consumed);
-      const entry = this.queue.shift()!;
-
-      if (typeof value === "string" && value.startsWith("ERR")) {
-        entry.reject(new LuxError(value));
-      } else {
-        entry.resolve(value);
-      }
-    }
-
-    if (this.buffer.length > 0 && this.queue.length === 0) {
-      queueMicrotask(() => this.processBuffer());
-    }
-  }
-
-  private parseOne(pos: number): [RespValue, number] | null {
-    if (pos >= this.buffer.length) return null;
-
-    const nl = this.buffer.indexOf("\r\n", pos);
-    if (nl === -1) return null;
-
-    const type = this.buffer[pos];
-    const line = this.buffer.slice(pos + 1, nl);
-    const after = nl + 2;
-
-    switch (type) {
-      case "+":
-        return [line, after];
-      case "-":
-        return [line, after];
-      case ":":
-        return [parseInt(line, 10), after];
-      case "$": {
-        const len = parseInt(line, 10);
-        if (len === -1) return [null, after];
-        const end = after + len + 2;
-        if (end > this.buffer.length) return null;
-        return [this.buffer.slice(after, after + len), end];
-      }
-      case "*": {
-        const count = parseInt(line, 10);
-        if (count === -1) return [null, after];
-        if (count === 0) return [[], after];
-        const arr: RespValue[] = [];
-        let cursor = after;
-        for (let i = 0; i < count; i++) {
-          const elem = this.parseOne(cursor);
-          if (elem === null) return null;
-          arr.push(elem[0]);
-          cursor = elem[1];
-        }
-        return [arr, cursor];
-      }
-      default:
-        return null;
-    }
   }
 }
