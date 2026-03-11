@@ -1,6 +1,7 @@
 import { Socket } from "net";
 import type { LuxConfig, RespValue } from "./types";
 import { LuxConnectionError, LuxError } from "./errors";
+import { LuxSubscriber } from "./subscriber";
 
 export class Lux {
   private socket: Socket | null = null;
@@ -48,6 +49,10 @@ export class Lux {
       this.socket.setNoDelay(true);
       this.socket.connect(this.port, this.host);
     });
+  }
+
+  createSubscriber(): LuxSubscriber {
+    return new LuxSubscriber({ host: this.host, port: this.port });
   }
 
   disconnect(): void {
