@@ -9,8 +9,8 @@ export class Lux {
   private port: number;
   private connected = false;
   private chunks: Buffer[] = [];
-  private buf = Buffer.alloc(0);
-  private waiting: ((chunk: Buffer) => void) | null = null;
+  private buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  private waiting: ((chunk: Buffer<ArrayBufferLike>) => void) | null = null;
 
   constructor(config: LuxConfig) {
     this.host = config.host;
