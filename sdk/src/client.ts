@@ -11,6 +11,7 @@ export class Lux {
   private chunks: Buffer[] = [];
   private buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   private waiting: ((chunk: Buffer<ArrayBufferLike>) => void) | null = null;
+  private queue: Promise<any> = Promise.resolve();
 
   constructor(config: LuxConfig) {
     this.host = config.host;
@@ -145,33 +146,43 @@ export class Lux {
   }
 
   async command(...args: (string | number)[]): Promise<RespValue> {
-    if (!this.socket || !this.connected) {
-      throw new LuxConnectionError("not connected");
-    }
-    this.socket.write(this.encode(args));
-    return this.readReply();
+    return this.enqueue(() => {
+      if (!this.socket || !this.connected) {
+        throw new LuxConnectionError("not connected");
+      }
+      this.socket.write(this.encode(args));
+      return this.readReply();
+    });
   }
 
   async pipeline(commands: (string | number)[][]): Promise<RespValue[]> {
-    if (!this.socket || !this.connected) {
-      throw new LuxConnectionError("not connected");
-    }
-
-    let encoded = "";
-    for (const args of commands) {
-      encoded += this.encode(args);
-    }
-    this.socket.write(encoded);
-
-    const results: RespValue[] = [];
-    for (let i = 0; i < commands.length; i++) {
-      try {
-        results.push(await this.readReply());
-      } catch (e) {
-        results.push(null);
+    return this.enqueue(async () => {
+      if (!this.socket || !this.connected) {
+        throw new LuxConnectionError("not connected");
       }
-    }
-    return results;
+
+      let encoded = "";
+      for (const args of commands) {
+        encoded += this.encode(args);
+      }
+      this.socket.write(encoded);
+
+      const results: RespValue[] = [];
+      for (let i = 0; i < commands.length; i++) {
+        try {
+          results.push(await this.readReply());
+        } catch (e) {
+          results.push(null);
+        }
+      }
+      return results;
+    });
+  }
+
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.queue.then(fn, fn);
+    this.queue = p.catch(() => {});
+    return p;
   }
 
   async set(key: string, value: string, ttl?: number): Promise<string> {
