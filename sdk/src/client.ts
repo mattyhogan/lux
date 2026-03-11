@@ -249,6 +249,10 @@ export class Lux {
         entry.resolve(value);
       }
     }
+
+    if (this.buffer.length > 0 && this.queue.length === 0) {
+      queueMicrotask(() => this.processBuffer());
+    }
   }
 
   private parseOne(pos: number): [RespValue, number] | null {
