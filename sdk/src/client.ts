@@ -72,6 +72,9 @@ export class Lux {
     return new Promise((resolve, reject) => {
       this.queue.push({ resolve, reject });
       this.socket!.write(encoded);
+      if (this.buffer.length > 0) {
+        this.processBuffer();
+      }
     });
   }
 
